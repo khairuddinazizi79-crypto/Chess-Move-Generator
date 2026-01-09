@@ -1,2 +1,2 @@
 # Chess-Move-Generator
-None
+High-performance C++ chess move generator with magic bitboards and parallel perft.
