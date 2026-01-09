@@ -1,50 +1,64 @@
-# Chess-Move-Generator
+#Chess Move Generator
+
 A high-performance chess move generator and perft counter written in modern C++ as a single-file project.
 The focus is on speed, clean bitboard-based design, and correctness.
 
-This project is not a full chess engine (no evaluation or search), but it implements:
-	•	Fully legal move generation
-	•	Fast make/unmake logic
-	•	Multi-threaded perft testing
-	•	A minimal UCI-compatible interface for testing
+This project is **not a full chess engine** (no evaluation or search), but it implements:
+
+- Fully legal move generation
+- Fast make/unmake logic
+- Multi-threaded perft testing
+- A minimal UCI-compatible interface for testing
+
+## Features
+
+- Bitboard-based board representation
+- Magic bitboards for bishop and rook attacks
+- Precomputed attack tables for:
+  - Pawns
+  - Knights
+  - Kings
+- Fully legal move generation:
+  - Captures
+  - Promotions
+  - Double pawn pushes
+  - En passant
+  - Castling
+- Legality checking (king-in-check filtering)
+- Optimized `make_move`
+  - Early exits
+  - Minimal branching
+- Parallel perft at root
+  - Fixed 6-thread implementation
+- Single source file, no dependencies
 
 
-Features
-	•	Bitboard-based board representation
-	•	Magic bitboards for bishop and rook attacks
-	•	Precomputed attack tables for:
-	•	Pawns
-	•	Knights
-	•	Kings
-	•	Fully legal move generation:
-	•	Captures
-	•	Promotions
-	•	Double pawn pushes
-	•	En passant
-	•	Castling
-	•	Legality checking (king-in-check filtering)
-	•	Optimized make_move
-	•	Early exits
-	•	Minimal branching
-	•	Parallel perft at root
-	•	Fixed 6-thread implementation
-	•	Single source file, no dependencies
-The program reads commands from stdin and understands a subset of the UCI protocol, mainly for perft testing.
-Basic UCI commands
+## Usage
 
+The program reads commands from **stdin** and understands a subset of the **UCI protocol**, mainly for perft testing.
+
+### Basic UCI commands
+```text
 uci
 isready
 
-Set a position 
-Start position: position startpos
+Set a position
 
+Start position:
 
-Custom FEN: position fen rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1
+position startpos
 
+Custom FEN:
 
-With moves: position startpos moves e2e4 e7e5 g1f3
+position fen rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1
 
-Output format: e2e4: ...
+With moves:
+
+position startpos moves e2e4 e7e5 g1f3
+
+Output format
+
+e2e4: ...
 d2d4: ...
 ...
 Nodes: 4865609
@@ -60,6 +74,7 @@ Board Representation
 	•	Black
 	•	Both
 	•	Side to move, castling rights, en passant square
+
 
 Move Representation
 
@@ -92,6 +107,7 @@ Perft Implementation
 	•	Thread-safe printing and node accumulation
 	•	Each thread works on its own board copy
 
+
 Design Goals
 	•	Maximum performance with readable code
 	•	Educational reference for:
@@ -100,6 +116,7 @@ Design Goals
 	•	Move generation
 	•	Perft validation
 	•	Easy to extend into a full chess engine
+
 
 Notes
 	•	No evaluation or search implemented
