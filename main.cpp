@@ -1,18 +1,16 @@
 /*
- * Optimized UCI Chess Engine & Parallel Perft Counter
- * Key optimizations:
- * - Magic bitboards for sliding piece attacks
- * - Move list with pre-allocated capacity
- * - Inline functions for hot paths
- * - Reduced branching in move generation
- * - Optimized make_move with early exits
- * - Multi-threaded Root Perft (6 threads)
+ * Highly optimized UCI Chess Engine & Parallel Perft Counter (improved)
  *
- * Compile: g++ -O3 -std=c++17 -march=native -pthread chess_perft.cpp -o chess_perft
+ * Main runtime optimizations:
+ * - Avoid std::vector in the recursive perft hot-path: use fixed-size arrays.
+ * - Undo-based make/unmake rather than copying the whole Board each move.
+ * - Inline hot functions and reduce branching where straightforward.
+ * - Reserve work per-thread at root; threads only copy the board once per root move.
+ *
+ * Compile: g++ -O3 -std=c++17 -march=native -pthread chess_perft_opt.cpp -o chess_perft_opt
  */
 
 #include <iostream>
-#include <vector>
 #include <string>
 #include <sstream>
 #include <cstring>
@@ -22,10 +20,8 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
-
-// ----------------------------------------------------------------------------
-// Types & Constants
-// ----------------------------------------------------------------------------
+#include <vector>
+#include <array>
 
 typedef uint64_t U64;
 
@@ -44,21 +40,14 @@ enum { white, black, both };
 enum { P, N, B, R, Q, K, p, n, b, r, q, k };
 enum { wk = 1, wq = 2, bk = 4, bq = 8 };
 
-const char* square_to_coord[] = {
-    "a1", "b1", "c1", "d1", "e1", "f1", "g1", "h1",
-    "a2", "b2", "c2", "d2", "e2", "f2", "g2", "h2",
-    "a3", "b3", "c3", "d3", "e3", "f3", "g3", "h3",
-    "a4", "b4", "c4", "d4", "e4", "f4", "g4", "h4",
-    "a5", "b5", "c5", "d5", "e5", "f5", "g5", "h5",
-    "a6", "b6", "c6", "d6", "e6", "f6", "g6", "h6",
-    "a7", "b7", "c7", "d7", "e7", "f7", "g7", "h7",
-    "a8", "b8", "c8", "d8", "e8", "f8", "g8", "h8"
+const char* square_to_coord[] = { "a1","b1","c1","d1","e1","f1","g1","h1",
+    "a2","b2","c2","d2","e2","f2","g2","h2","a3","b3","c3","d3","e3","f3","g3","h3",
+    "a4","b4","c4","d4","e4","f4","g4","h4","a5","b5","c5","d5","e5","f5","g5","h5",
+    "a6","b6","c6","d6","e6","f6","g6","h6","a7","b7","c7","d7","e7","f7","g7","h7",
+    "a8","b8","c8","d8","e8","f8","g8","h8"
 };
 
-// ----------------------------------------------------------------------------
-// Bit Manipulation
-// ----------------------------------------------------------------------------
-
+// Bit helpers
 #define get_bit(bb, sq) ((bb) & (1ULL << (sq)))
 #define set_bit(bb, sq) ((bb) |= (1ULL << (sq)))
 #define pop_bit(bb, sq) ((bb) &= ~(1ULL << (sq)))
@@ -68,20 +57,13 @@ static inline int pop_lsb(U64& bb) {
     bb &= bb - 1;
     return sq;
 }
+static inline int count_bits(U64 bb) { return __builtin_popcountll(bb); }
 
-static inline int count_bits(U64 bb) {
-    return __builtin_popcountll(bb);
-}
-
-// ----------------------------------------------------------------------------
-// Attack Tables
-// ----------------------------------------------------------------------------
-
+// Attack tables (unchanged)
 U64 pawn_attacks[2][64];
 U64 knight_attacks[64];
 U64 king_attacks[64];
 
-// Simplified magic bitboards (using perfect hash for speed)
 U64 bishop_masks[64];
 U64 rook_masks[64];
 U64 bishop_attacks[64][512];
@@ -125,6 +107,7 @@ const U64 rook_magics[64] = {
     0x20030a0244872ULL, 0x12001008414402ULL, 0x2006104900a0804ULL, 0x1004081002402ULL
 };
 
+// masks and on-fly attack generation (unchanged)
 U64 mask_bishop_attacks(int sq) {
     U64 attacks = 0ULL;
     int r = sq / 8, f = sq % 8;
@@ -193,35 +176,39 @@ void init_sliders() {
     for (int sq = 0; sq < 64; sq++) {
         bishop_masks[sq] = mask_bishop_attacks(sq);
         rook_masks[sq] = mask_rook_attacks(sq);
-        
+
         int bishop_bits = count_bits(bishop_masks[sq]);
         int rook_bits = count_bits(rook_masks[sq]);
-        
-        for (int i = 0; i < (1 << bishop_bits); i++) {
+
+        // bishop
+        int bishop_variations = 1 << bishop_bits;
+        for (int i = 0; i < bishop_variations; ++i) {
             U64 occ = 0ULL;
             U64 mask = bishop_masks[sq];
             int count = 0;
-            U64 temp = mask;
-            while (temp) {
-                int bit = pop_lsb(temp);
+            U64 tmp = mask;
+            while (tmp) {
+                int bit = pop_lsb(tmp);
                 if (i & (1 << count)) set_bit(occ, bit);
-                count++;
+                ++count;
             }
-            int magic_index = (occ * bishop_magics[sq]) >> (64 - 9);
+            int magic_index = (int)((occ * bishop_magics[sq]) >> (64 - 9));
             bishop_attacks[sq][magic_index] = bishop_attacks_on_fly(sq, occ);
         }
-        
-        for (int i = 0; i < (1 << rook_bits); i++) {
+
+        // rook
+        int rook_variations = 1 << rook_bits;
+        for (int i = 0; i < rook_variations; ++i) {
             U64 occ = 0ULL;
             U64 mask = rook_masks[sq];
             int count = 0;
-            U64 temp = mask;
-            while (temp) {
-                int bit = pop_lsb(temp);
+            U64 tmp = mask;
+            while (tmp) {
+                int bit = pop_lsb(tmp);
                 if (i & (1 << count)) set_bit(occ, bit);
-                count++;
+                ++count;
             }
-            int magic_index = (occ * rook_magics[sq]) >> (64 - 12);
+            int magic_index = (int)((occ * rook_magics[sq]) >> (64 - 12));
             rook_attacks[sq][magic_index] = rook_attacks_on_fly(sq, occ);
         }
     }
@@ -233,22 +220,24 @@ inline U64 get_bishop_attacks(int sq, U64 occ) {
     occ >>= 64 - 9;
     return bishop_attacks[sq][occ];
 }
-
 inline U64 get_rook_attacks(int sq, U64 occ) {
     occ &= rook_masks[sq];
     occ *= rook_magics[sq];
     occ >>= 64 - 12;
     return rook_attacks[sq][occ];
 }
-
 inline U64 get_queen_attacks(int sq, U64 occ) {
     return get_bishop_attacks(sq, occ) | get_rook_attacks(sq, occ);
 }
 
 void init_leapers() {
-    for (int sq = 0; sq < 64; sq++) {
+    for (int sq = 0; sq < 64; ++sq) {
+        pawn_attacks[white][sq] = pawn_attacks[black][sq] = 0ULL;
+        knight_attacks[sq] = king_attacks[sq] = 0ULL;
+    }
+
+    for (int sq = 0; sq < 64; ++sq) {
         int r = sq / 8, f = sq % 8;
-        
         if (r < 7) {
             if (f > 0) set_bit(pawn_attacks[white][sq], sq + 7);
             if (f < 7) set_bit(pawn_attacks[white][sq], sq + 9);
@@ -258,43 +247,39 @@ void init_leapers() {
             if (f < 7) set_bit(pawn_attacks[black][sq], sq - 7);
         }
 
-        int n_offsets[] = {17, 15, 10, 6, -6, -10, -15, -17};
+        const int n_offsets[] = {17,15,10,6,-6,-10,-15,-17};
         for (int off : n_offsets) {
             int target = sq + off;
             if (target >= 0 && target < 64) {
-                int dr = abs(r - target / 8);
-                int df = abs(f - target % 8);
+                int dr = std::abs(r - target/8), df = std::abs(f - target%8);
                 if (dr + df == 3 && dr != 0 && df != 0) set_bit(knight_attacks[sq], target);
             }
         }
 
-        int k_offsets[] = {8, -8, 1, -1, 9, 7, -7, -9};
+        const int k_offsets[] = {8,-8,1,-1,9,7,-7,-9};
         for (int off : k_offsets) {
             int target = sq + off;
-            if (target >= 0 && target < 64 && abs(r - target / 8) <= 1 && abs(f - target % 8) <= 1)
+            if (target >= 0 && target < 64 && std::abs(r - target/8) <= 1 && std::abs(f - target%8) <= 1)
                 set_bit(king_attacks[sq], target);
         }
     }
 }
 
-// ----------------------------------------------------------------------------
 // Board & Move
-// ----------------------------------------------------------------------------
-
 struct Move {
     int source;
     int target;
-    int promoted;
+    int promoted;      // -1 if none, else piece index (P..K or p..k)
     bool capture;
     bool double_push;
     bool en_passant;
     bool castling;
 };
 
-std::string to_string(const Move& m) {
+static inline std::string move_to_string(const Move& m) {
     std::string s = std::string(square_to_coord[m.source]) + square_to_coord[m.target];
     if (m.promoted != -1) {
-        int p = m.promoted > 6 ? m.promoted - 6 : m.promoted;
+        int p = (m.promoted > 6 ? m.promoted - 6 : m.promoted);
         s += (p == N ? 'n' : p == B ? 'b' : p == R ? 'r' : 'q');
     }
     return s;
@@ -310,7 +295,7 @@ public:
 
     Board() { reset(); }
 
-    void reset() {
+    inline void reset() {
         memset(bitboards, 0, sizeof(bitboards));
         memset(occupancies, 0, sizeof(occupancies));
         side = white;
@@ -321,7 +306,7 @@ public:
     inline void update_occupancies() {
         occupancies[white] = bitboards[P] | bitboards[N] | bitboards[B] | bitboards[R] | bitboards[Q] | bitboards[K];
         occupancies[black] = bitboards[p] | bitboards[n] | bitboards[b] | bitboards[r] | bitboards[q] | bitboards[k];
-        occupancies[both] = occupancies[white] | occupancies[black];
+        occupancies[both]  = occupancies[white] | occupancies[black];
     }
 
     inline bool is_square_attacked(int sq, int by_side) const {
@@ -345,7 +330,7 @@ public:
         return false;
     }
 
-    void parse_fen(std::string fen) {
+    void parse_fen(const std::string& fen) {
         reset();
         std::stringstream ss(fen);
         std::string placement, turn, castling, ep_str;
@@ -367,10 +352,9 @@ public:
                     case 'q': piece = q; break; case 'k': piece = k; break;
                 }
                 if (piece != -1) set_bit(bitboards[piece], sq);
-                file++;
+                ++file;
             }
         }
-        
         side = (turn == "w") ? white : black;
         castle = 0;
         if (castling != "-") {
@@ -379,83 +363,82 @@ public:
             if (castling.find('k') != std::string::npos) castle |= bk;
             if (castling.find('q') != std::string::npos) castle |= bq;
         }
-
-        if (ep_str != "-") {
-            en_passant = (ep_str[1] - '1') * 8 + (ep_str[0] - 'a');
-        } else en_passant = no_sq;
+        if (ep_str != "-") en_passant = (ep_str[1] - '1') * 8 + (ep_str[0] - 'a');
+        else en_passant = no_sq;
         update_occupancies();
     }
 };
 
-// ----------------------------------------------------------------------------
-// Move Generation (Optimized)
-// ----------------------------------------------------------------------------
+// Undo record (small)
+struct Undo {
+    int move_piece;
+    int captured_piece;
+    int captured_sq;
+    int prev_en_passant;
+    int prev_castle;
+    bool was_promotion;
+    bool was_castling;
+};
 
-template<bool GenCaps, bool GenQuiets>
-inline void add_pawn_moves(std::vector<Move>& moves, int src, int tgt, bool is_capture, bool is_promo, int promo_start) {
+// Move generation: fill a fixed array, returns count. Avoid dynamic alloc.
+inline void add_pawn_moves_static(Move* moves, int& idx, int src, int tgt, bool is_capture, bool is_promo, int promo_start, bool gen_caps, bool gen_quiets) {
     if (is_promo) {
-        if (GenCaps && is_capture) {
-            moves.push_back({src, tgt, promo_start + 4, 1, 0, 0, 0});
-            moves.push_back({src, tgt, promo_start + 3, 1, 0, 0, 0});
-            moves.push_back({src, tgt, promo_start + 2, 1, 0, 0, 0});
-            moves.push_back({src, tgt, promo_start + 1, 1, 0, 0, 0});
-        } else if (GenQuiets && !is_capture) {
-            moves.push_back({src, tgt, promo_start + 4, 0, 0, 0, 0});
-            moves.push_back({src, tgt, promo_start + 3, 0, 0, 0, 0});
-            moves.push_back({src, tgt, promo_start + 2, 0, 0, 0, 0});
-            moves.push_back({src, tgt, promo_start + 1, 0, 0, 0, 0});
+        if (gen_caps && is_capture) {
+            moves[idx++] = {src,tgt,promo_start+4,true,false,false,false};
+            moves[idx++] = {src,tgt,promo_start+3,true,false,false,false};
+            moves[idx++] = {src,tgt,promo_start+2,true,false,false,false};
+            moves[idx++] = {src,tgt,promo_start+1,true,false,false,false};
+        } else if (gen_quiets && !is_capture) {
+            moves[idx++] = {src,tgt,promo_start+4,false,false,false,false};
+            moves[idx++] = {src,tgt,promo_start+3,false,false,false,false};
+            moves[idx++] = {src,tgt,promo_start+2,false,false,false,false};
+            moves[idx++] = {src,tgt,promo_start+1,false,false,false,false};
         }
     } else {
-        if ((GenCaps && is_capture) || (GenQuiets && !is_capture)) {
-            moves.push_back({src, tgt, -1, is_capture, 0, 0, 0});
+        if ((gen_caps && is_capture) || (gen_quiets && !is_capture)) {
+            moves[idx++] = {src,tgt,-1,is_capture,false,false,false};
         }
     }
 }
 
-void generate_moves(Board& board, std::vector<Move>& moves) {
-    moves.clear();
-    moves.reserve(218);
-    
+// generate_moves writes to moves[] and returns count (no allocations)
+int generate_moves(const Board& board, Move* moves) {
+    int mcount = 0;
     int us = board.side;
     int them = us ^ 1;
     U64 our_pieces = board.occupancies[us];
     U64 their_pieces = board.occupancies[them];
     U64 empty = ~board.occupancies[both];
-    
+
     if (us == white) {
         U64 pawns = board.bitboards[P];
         while (pawns) {
             int src = pop_lsb(pawns);
             int tgt = src + 8;
             bool promo = src >= a7;
-            
             if (tgt < 64 && get_bit(empty, tgt)) {
-                add_pawn_moves<false, true>(moves, src, tgt, false, promo, P);
+                add_pawn_moves_static(moves, mcount, src, tgt, false, promo, P, false, true);
                 if (src >= a2 && src <= h2 && get_bit(empty, src + 16)) {
-                    moves.push_back({src, src + 16, -1, 0, 1, 0, 0});
+                    moves[mcount++] = {src, src + 16, -1, false, true, false, false};
                 }
             }
-            
             U64 attacks = pawn_attacks[white][src] & their_pieces;
             while (attacks) {
-                tgt = pop_lsb(attacks);
-                add_pawn_moves<true, false>(moves, src, tgt, true, promo, P);
+                int t = pop_lsb(attacks);
+                add_pawn_moves_static(moves, mcount, src, t, true, promo, P, true, false);
             }
-            
             if (board.en_passant != no_sq && (pawn_attacks[white][src] & (1ULL << board.en_passant))) {
-                moves.push_back({src, board.en_passant, -1, 1, 0, 1, 0});
+                moves[mcount++] = {src, board.en_passant, -1, true, false, true, false};
             }
         }
-        
+        // castling
         if ((board.castle & wk) && !(board.occupancies[both] & 0x60ULL)) {
-            if (!board.is_square_attacked(e1, black) && !board.is_square_attacked(f1, black)) {
-                moves.push_back({e1, g1, -1, 0, 0, 0, 1});
-            }
+            if (!board.is_square_attacked(e1, black) && !board.is_square_attacked(f1, black))
+                moves[mcount++] = {e1, g1, -1, false, false, false, true};
         }
         if ((board.castle & wq) && !(board.occupancies[both] & 0xEULL)) {
-            if (!board.is_square_attacked(e1, black) && !board.is_square_attacked(d1, black)) {
-                moves.push_back({e1, c1, -1, 0, 0, 0, 1});
-            }
+            if (!board.is_square_attacked(e1, black) && !board.is_square_attacked(d1, black))
+                moves[mcount++] = {e1, c1, -1, false, false, false, true};
         }
     } else {
         U64 pawns = board.bitboards[p];
@@ -463,135 +446,180 @@ void generate_moves(Board& board, std::vector<Move>& moves) {
             int src = pop_lsb(pawns);
             int tgt = src - 8;
             bool promo = src >= a2 && src <= h2;
-            
             if (tgt >= 0 && get_bit(empty, tgt)) {
-                add_pawn_moves<false, true>(moves, src, tgt, false, promo, p);
+                add_pawn_moves_static(moves, mcount, src, tgt, false, promo, p, false, true);
                 if (src >= a7 && src <= h7 && get_bit(empty, src - 16)) {
-                    moves.push_back({src, src - 16, -1, 0, 1, 0, 0});
+                    moves[mcount++] = {src, src - 16, -1, false, true, false, false};
                 }
             }
-            
             U64 attacks = pawn_attacks[black][src] & their_pieces;
             while (attacks) {
-                tgt = pop_lsb(attacks);
-                add_pawn_moves<true, false>(moves, src, tgt, true, promo, p);
+                int t = pop_lsb(attacks);
+                add_pawn_moves_static(moves, mcount, src, t, true, promo, p, true, false);
             }
-            
             if (board.en_passant != no_sq && (pawn_attacks[black][src] & (1ULL << board.en_passant))) {
-                moves.push_back({src, board.en_passant, -1, 1, 0, 1, 0});
+                moves[mcount++] = {src, board.en_passant, -1, true, false, true, false};
             }
         }
-        
         if ((board.castle & bk) && !(board.occupancies[both] & 0x6000000000000000ULL)) {
-            if (!board.is_square_attacked(e8, white) && !board.is_square_attacked(f8, white)) {
-                moves.push_back({e8, g8, -1, 0, 0, 0, 1});
-            }
+            if (!board.is_square_attacked(e8, white) && !board.is_square_attacked(f8, white))
+                moves[mcount++] = {e8, g8, -1, false, false, false, true};
         }
         if ((board.castle & bq) && !(board.occupancies[both] & 0xE00000000000000ULL)) {
-            if (!board.is_square_attacked(e8, white) && !board.is_square_attacked(d8, white)) {
-                moves.push_back({e8, c8, -1, 0, 0, 0, 1});
-            }
+            if (!board.is_square_attacked(e8, white) && !board.is_square_attacked(d8, white))
+                moves[mcount++] = {e8, c8, -1, false, false, false, true};
         }
     }
 
-    int pieces[] = {us == white ? N : n, us == white ? B : b, us == white ? R : r, us == white ? Q : q, us == white ? K : k};
-    
-    for (int piece : pieces) {
+    // Non-pawn pieces
+    const int pieces[5] = { (us==white?N:n), (us==white?B:b), (us==white?R:r), (us==white?Q:q), (us==white?K:k) };
+    for (int pt = 0; pt < 5; ++pt) {
+        int piece = pieces[pt];
         U64 bb = board.bitboards[piece];
         while (bb) {
             int src = pop_lsb(bb);
             U64 attacks = 0ULL;
-            
             if (piece == N || piece == n) attacks = knight_attacks[src];
             else if (piece == B || piece == b) attacks = get_bishop_attacks(src, board.occupancies[both]);
             else if (piece == R || piece == r) attacks = get_rook_attacks(src, board.occupancies[both]);
             else if (piece == Q || piece == q) attacks = get_queen_attacks(src, board.occupancies[both]);
             else attacks = king_attacks[src];
-            
+
             attacks &= ~our_pieces;
-            
             while (attacks) {
                 int tgt = pop_lsb(attacks);
-                bool cap = get_bit(their_pieces, tgt);
-                moves.push_back({src, tgt, -1, cap, 0, 0, 0});
+                bool cap = (get_bit(their_pieces, tgt) != 0);
+                moves[mcount++] = {src, tgt, -1, cap, false, false, false};
             }
         }
     }
+    return mcount;
 }
 
-// ----------------------------------------------------------------------------
-// Make Move (Optimized)
-// ----------------------------------------------------------------------------
+// Fast helper: locate piece index at a square for side 'side'
+inline int piece_on_square(const Board& board, int side, int sq) {
+    int start = (side == white) ? P : p;
+    int end   = (side == white) ? K : k;
+    for (int i = start; i <= end; ++i) if (get_bit(board.bitboards[i], sq)) return i;
+    return -1;
+}
 
-inline bool make_move(Board& board, Move move, int flag) {
-    Board backup = board;
+// make_move with undo (no full board copy). Returns true if legal, false if move leaves king in check.
+inline bool make_move(Board& board, const Move& move, Undo& undo) {
+    // save undo basics
+    undo.prev_en_passant = board.en_passant;
+    undo.prev_castle = board.castle;
+    undo.was_promotion = (move.promoted != -1);
+    undo.was_castling = move.castling;
+    undo.captured_piece = -1;
+    undo.captured_sq = -1;
+
     int side = board.side;
-    
-    int move_piece = -1;
-    int piece_start = side == white ? P : p;
-    int piece_end = side == white ? K : k;
-    
-    for (int i = piece_start; i <= piece_end; i++) {
-        if (get_bit(board.bitboards[i], move.source)) {
-            move_piece = i;
-            break;
-        }
-    }
-    
-    pop_bit(board.bitboards[move_piece], move.source);
-    set_bit(board.bitboards[move_piece], move.target);
+    int piece_start = (side == white) ? P : p;
+    int piece_end   = (side == white) ? K : k;
 
+    // find moving piece index
+    int move_piece = -1;
+    for (int i = piece_start; i <= piece_end; ++i) {
+        if (get_bit(board.bitboards[i], move.source)) { move_piece = i; break; }
+    }
+    if (move_piece == -1) return false; // invalid
+
+    undo.move_piece = move_piece;
+
+    // Remove from source
+    pop_bit(board.bitboards[move_piece], move.source);
+
+    // Handle captures
     if (move.capture) {
         if (move.en_passant) {
-            int victim_sq = side == white ? move.target - 8 : move.target + 8;
-            int victim_pawn = side == white ? p : P;
-            pop_bit(board.bitboards[victim_pawn], victim_sq);
+            int victim_sq = (side == white) ? move.target - 8 : move.target + 8;
+            int victim_piece = (side == white) ? p : P;
+            // victim is pawn by definition
+            pop_bit(board.bitboards[victim_piece], victim_sq);
+            undo.captured_piece = victim_piece;
+            undo.captured_sq = victim_sq;
         } else {
-            int cap_start = side == white ? p : P;
-            int cap_end = side == white ? k : K;
-            for (int i = cap_start; i <= cap_end; i++) {
+            // find captured piece at target
+            int cap_start = (side == white) ? p : P;
+            int cap_end   = (side == white) ? k : K;
+            for (int i = cap_start; i <= cap_end; ++i) {
                 if (get_bit(board.bitboards[i], move.target)) {
                     pop_bit(board.bitboards[i], move.target);
+                    undo.captured_piece = i;
+                    undo.captured_sq = move.target;
                     break;
                 }
             }
         }
     }
 
+    // Place moving piece (or promotion)
     if (move.promoted != -1) {
-        pop_bit(board.bitboards[move_piece], move.target);
+        // place promoted piece
         set_bit(board.bitboards[move.promoted], move.target);
+    } else {
+        set_bit(board.bitboards[move_piece], move.target);
     }
 
+    // Castling rook move
     if (move.castling) {
-        switch(move.target) {
-            case g1: pop_bit(board.bitboards[R], h1); set_bit(board.bitboards[R], f1); break;
-            case c1: pop_bit(board.bitboards[R], a1); set_bit(board.bitboards[R], d1); break;
-            case g8: pop_bit(board.bitboards[r], h8); set_bit(board.bitboards[r], f8); break;
-            case c8: pop_bit(board.bitboards[r], a8); set_bit(board.bitboards[r], d8); break;
-        }
+        if (move.target == g1) { pop_bit(board.bitboards[R], h1); set_bit(board.bitboards[R], f1); }
+        else if (move.target == c1) { pop_bit(board.bitboards[R], a1); set_bit(board.bitboards[R], d1); }
+        else if (move.target == g8) { pop_bit(board.bitboards[r], h8); set_bit(board.bitboards[r], f8); }
+        else if (move.target == c8) { pop_bit(board.bitboards[r], a8); set_bit(board.bitboards[r], d8); }
     }
 
+    // Update castling rights
     if (move_piece == K || move_piece == k) {
         board.castle &= (side == white) ? ~(wk | wq) : ~(bk | bq);
     } else if (move_piece == R || move_piece == r) {
-        if (move.source == h1 || move.target == h1) board.castle &= ~wk;
-        else if (move.source == a1 || move.target == a1) board.castle &= ~wq;
-        else if (move.source == h8 || move.target == h8) board.castle &= ~bk;
-        else if (move.source == a8 || move.target == a8) board.castle &= ~bq;
-    } else {
-        if (move.target == h1) board.castle &= ~wk;
-        else if (move.target == a1) board.castle &= ~wq;
-        else if (move.target == h8) board.castle &= ~bk;
-        else if (move.target == a8) board.castle &= ~bq;
+        // if rook moved from corner, remove right
+        if (move.source == h1) board.castle &= ~wk;
+        else if (move.source == a1) board.castle &= ~wq;
+        else if (move.source == h8) board.castle &= ~bk;
+        else if (move.source == a8) board.castle &= ~bq;
+    }
+    // if capture target was rook from original corner
+    if (undo.captured_piece == R) {
+        if (undo.captured_sq == h1) board.castle &= ~wk;
+        else if (undo.captured_sq == a1) board.castle &= ~wq;
+    } else if (undo.captured_piece == r) {
+        if (undo.captured_sq == h8) board.castle &= ~bk;
+        else if (undo.captured_sq == a8) board.castle &= ~bq;
     }
 
+    // Set en_passant square
     board.en_passant = move.double_push ? (side == white ? move.target - 8 : move.target + 8) : no_sq;
+
     board.update_occupancies();
 
-    int k_sq = __builtin_ctzll(board.bitboards[side == white ? K : k]);
+    // King safety
+    int k_sq = __builtin_ctzll(board.bitboards[(side==white)?K:k]);
     if (board.is_square_attacked(k_sq, side ^ 1)) {
-        board = backup;
+        // undo everything quickly
+        // remove piece from target
+        if (move.promoted != -1) pop_bit(board.bitboards[move.promoted], move.target);
+        else pop_bit(board.bitboards[move_piece], move.target);
+
+        // restore moving piece to source
+        set_bit(board.bitboards[move_piece], move.source);
+
+        // restore captured piece if any
+        if (undo.captured_piece != -1) set_bit(board.bitboards[undo.captured_piece], undo.captured_sq);
+
+        // undo castling rook if applied
+        if (move.castling) {
+            if (move.target == g1) { set_bit(board.bitboards[R], h1); pop_bit(board.bitboards[R], f1); }
+            else if (move.target == c1) { set_bit(board.bitboards[R], a1); pop_bit(board.bitboards[R], d1); }
+            else if (move.target == g8) { set_bit(board.bitboards[r], h8); pop_bit(board.bitboards[r], f8); }
+            else if (move.target == c8) { set_bit(board.bitboards[r], a8); pop_bit(board.bitboards[r], d8); }
+        }
+
+        // restore metadata
+        board.en_passant = undo.prev_en_passant;
+        board.castle = undo.prev_castle;
+        board.update_occupancies();
         return false;
     }
 
@@ -599,98 +627,99 @@ inline bool make_move(Board& board, Move move, int flag) {
     return true;
 }
 
-// ----------------------------------------------------------------------------
-// Perft (Multi-threaded)
-// ----------------------------------------------------------------------------
+inline void unmake_move(Board& board, const Move& move, const Undo& undo) {
+    board.side ^= 1; // side was toggled in make_move
 
-// Recursive driver now returns count instead of using global
-uint64_t perft_driver(Board& board, int depth) {
-    if (depth == 0) {
-        return 1ULL;
+    // remove piece from target
+    if (move.promoted != -1) pop_bit(board.bitboards[move.promoted], move.target);
+    else {
+        pop_bit(board.bitboards[undo.move_piece], move.target);
     }
 
-    std::vector<Move> moves;
-    generate_moves(board, moves);
+    // restore move piece to source
+    set_bit(board.bitboards[undo.move_piece], move.source);
 
-    uint64_t nodes = 0;
-    Board backup = board;
-    
-    for (const auto& move : moves) {
-        if (make_move(board, move, 0)) {
+    // restore captured piece if present
+    if (undo.captured_piece != -1) {
+        set_bit(board.bitboards[undo.captured_piece], undo.captured_sq);
+    }
+
+    // undo castling rook move
+    if (undo.was_castling) {
+        if (move.target == g1) { set_bit(board.bitboards[R], h1); pop_bit(board.bitboards[R], f1); }
+        else if (move.target == c1) { set_bit(board.bitboards[R], a1); pop_bit(board.bitboards[R], d1); }
+        else if (move.target == g8) { set_bit(board.bitboards[r], h8); pop_bit(board.bitboards[r], f8); }
+        else if (move.target == c8) { set_bit(board.bitboards[r], a8); pop_bit(board.bitboards[r], d8); }
+    }
+
+    // restore en_passant and castle
+    board.en_passant = undo.prev_en_passant;
+    board.castle = undo.prev_castle;
+    board.update_occupancies();
+}
+
+// perft recursive driver using static arrays
+uint64_t perft_driver(Board& board, int depth) {
+    if (depth == 0) return 1ULL;
+
+    Move moves[256];
+    int n = generate_moves(board, moves);
+    uint64_t nodes = 0ULL;
+
+    Undo undo;
+    for (int i = 0; i < n; ++i) {
+        if (make_move(board, moves[i], undo)) {
             nodes += perft_driver(board, depth - 1);
-            board = backup;
+            unmake_move(board, moves[i], undo);
         }
     }
     return nodes;
 }
 
 void perft_test(Board& board, int depth) {
-    std::cout << "Performance test (depth " << depth << ") [6 Threads]" << std::endl;
-    
-    // Generate root moves first
-    std::vector<Move> moves;
-    generate_moves(board, moves);
-    
-    // Threading synchronization
+    std::cout << "Performance test (depth " << depth << ") [6 Threads]\n";
+    Move root_moves[256];
+    int num_moves = generate_moves(board, root_moves);
+
     std::atomic<int> current_move_idx(0);
     std::atomic<uint64_t> total_nodes(0);
     std::mutex print_mutex;
-    
-    int num_moves = moves.size();
+
     auto start = std::chrono::high_resolution_clock::now();
 
-    // Worker function for threads
-    auto worker = [&](int thread_id) {
+    auto worker = [&](int) {
         while (true) {
-            // Fetch next move index atomically
             int idx = current_move_idx.fetch_add(1);
             if (idx >= num_moves) break;
-
-            Move move = moves[idx];
-            
-            // Each thread works on its own copy of the board
-            Board local_board = board;
-            
-            if (make_move(local_board, move, 0)) {
-                uint64_t nodes = perft_driver(local_board, depth - 1);
-                
-                // Print result safely
-                {
-                    std::lock_guard<std::mutex> lock(print_mutex);
-                    std::cout << to_string(move) << ": " << nodes << std::endl;
-                }
-                
-                total_nodes += nodes;
+            Move mv = root_moves[idx];
+            Board local = board;
+            Undo undo;
+            if (!make_move(local, mv, undo)) continue;
+            uint64_t nodes = perft_driver(local, depth - 1);
+            {
+                std::lock_guard<std::mutex> lock(print_mutex);
+                std::cout << move_to_string(mv) << ": " << nodes << "\n";
             }
+            total_nodes += nodes;
         }
     };
 
-    // Launch 6 threads
+    const int THREADS = 6;
     std::vector<std::thread> threads;
-    for (int i = 0; i < 6; ++i) {
-        threads.emplace_back(worker, i);
-    }
-
-    // Join threads
-    for (auto& t : threads) {
-        t.join();
-    }
+    threads.reserve(THREADS);
+    for (int t = 0; t < THREADS; ++t) threads.emplace_back(worker, t);
+    for (auto& th : threads) th.join();
 
     auto end = std::chrono::high_resolution_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-
-    std::cout << "\nNodes: " << total_nodes.load() << std::endl;
-    std::cout << "Time: " << ms.count() << "ms" << std::endl;
+    std::cout << "\nNodes: " << total_nodes.load() << "\n";
+    std::cout << "Time: " << ms.count() << "ms\n";
 }
-
-// ----------------------------------------------------------------------------
-// Main
-// ----------------------------------------------------------------------------
 
 int main() {
     init_leapers();
     init_sliders();
-    
+
     Board board;
     board.parse_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
 
@@ -698,42 +727,37 @@ int main() {
     while (std::getline(std::cin, line)) {
         std::stringstream ss(line);
         ss >> token;
-
         if (token == "uci") {
             std::cout << "id name OptimizedPerft\nid author Optimized\nuciok\n";
-        } 
-        else if (token == "isready") std::cout << "readyok\n";
+        } else if (token == "isready") std::cout << "readyok\n";
         else if (token == "position") {
             ss >> token;
             if (token == "startpos") {
                 board.parse_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
-                ss >> token; 
+                ss >> token;
             } else if (token == "fen") {
                 std::string fen;
                 while (ss >> token && token != "moves") fen += token + " ";
                 board.parse_fen(fen);
             }
             while (ss >> token) {
-                std::vector<Move> moves;
-                generate_moves(board, moves);
-                for (auto& m : moves) {
-                    if (to_string(m) == token) {
-                        make_move(board, m, 0);
+                Move moves[256];
+                int n = generate_moves(board, moves);
+                for (int i = 0; i < n; ++i) {
+                    if (move_to_string(moves[i]) == token) {
+                        Undo undo;
+                        make_move(board, moves[i], undo);
                         break;
                     }
                 }
             }
-        } 
-        else if (token == "go") {
+        } else if (token == "go") {
             ss >> token;
             if (token == "perft") {
-                int depth;
-                ss >> depth;
+                int depth; ss >> depth;
                 perft_test(board, depth);
             }
-        } 
-        else if (token == "quit") break;
+        } else if (token == "quit") break;
     }
     return 0;
 }
-
